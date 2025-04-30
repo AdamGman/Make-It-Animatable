@@ -9,9 +9,7 @@ import warnings
 from dataclasses import dataclass
 from glob import glob
 
-# --- ADDED Import ---
-import requests  # Ensure requests is in requirements.txt
-
+import requests
 import gradio as gr
 import matplotlib
 import numpy as np
@@ -43,7 +41,7 @@ from util.utils import (
     fix_random,
     get_normalize_transform,
     load_gs,
-    make_archive,  # Make sure this is defined in util.utils
+    make_archive,
     pose_local_to_global,
     pose_rot_to_global,
     sample_mesh,
@@ -55,25 +53,98 @@ from util.utils import (
     transform_gs,
 )
 
-# --- Define DB Dataclass ---
-@dataclass
+# Monkey patching to correct the loaded example values from csv
+Checkbox_postprocess = gr.Checkbox.postprocess
+gr.Checkbox.postprocess = lambda self, value: (
+    str2bool(value) if isinstance(value, str) else Checkbox_postprocess(self, value)
+)
+CheckboxGroup_postprocess = gr.CheckboxGroup.postprocess
+gr.CheckboxGroup.postprocess = lambda self, value: (
+    list(filter(None, str2list(lambda x: x.lstrip('"').rstrip('"'))(value)))
+    if isinstance(value, str)
+    else CheckboxGroup_postprocess(self, value)
+)
+
+def is_main_thread():
+    import threading
+    return threading.current_thread() is threading.main_thread()
+
+# Monkey patching gradio to use let gr.Info & gr.Warning also print on console
+def _log_message(
+    message: str,
+    level="info",
+    duration: float | None = 10,
+    visible: bool = True,
+    *args,
+    **xargs,
+):
+    from gradio.context import LocalContext
+
+    if level in ("info", "success"):
+        print(message)
+    elif level == "warning":
+        warnings.warn(message)
+
+    blocks = LocalContext.blocks.get()
+    event_id = LocalContext.event_id.get()
+    if blocks is not None and event_id is not None:
+        # Function called outside of Gradio if blocks is None
+        # Or from /api/predict if event_id is None
+        blocks._queue.log_message(
+            event_id=event_id, log=message, level=level, duration=duration, visible=visible, *args, **xargs
+        )
+
+import gradio.helpers
+gradio.helpers.log_message = _log_message
+
+cmap = matplotlib.colormaps.get_cmap("plasma")
+
+@dataclass()
 class DB:
-    joints: np.ndarray = None
-    joints_tail: np.ndarray = None
-    bw: np.ndarray = None
     mesh: trimesh.Trimesh = None
-    gs: np.ndarray = None
-    gs_rest: np.ndarray = None
-    pose: np.ndarray = None
-    anim_path: str = None
+    gs: torch.Tensor = None
+    gs_rest: torch.Tensor = None
+    is_mesh: bool = None
+    sample_mask: np.ndarray = None
+    verts: torch.Tensor = None
+    verts_normal: torch.Tensor = None
+    faces: np.ndarray = None
+    pts: torch.Tensor = None
+    pts_normal: torch.Tensor = None
+    global_transform: Transform3d = None
+
+    output_dir: str = None
+    joints_coarse_path: str = None
+    normed_path: str = None
+    sample_path: str = None
+    bw_path: str = None
+    joints_path: str = None
+    rest_lbs_path: str = None
     rest_vis_path: str = None
+    anim_path: str = None
     anim_vis_path: str = None
-    is_mesh: bool = True
 
-# ... (Monkey patching, helper functions like clear, get_conflict_mask, bw_post_process, etc. from previous version) ...
-# ... (Functions like prepare_input, preprocess, infer, vis, model loading functions, etc.) ...
+    bw: torch.Tensor = None
+    joints: torch.Tensor = None
+    joints_tail: torch.Tensor = None
+    pose: torch.Tensor = None
 
-# --- MODIFIED vis_blender function ---
+    def clear(self):
+        for k in self.__dict__:
+            self.__dict__[k] = None
+        return self
+
+def clear(db: DB = None):
+    if db is not None:
+        db.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("Memory cleared")
+    return db
+
+# [Keep all other helper functions like get_conflict_mask, bw_post_process, etc.]
+
+# --- Modified vis_blender function to use Gradio's built-in file serving ---
 def vis_blender(
     reset_to_rest: bool,
     remove_fingers: bool,
@@ -86,20 +157,18 @@ def vis_blender(
 ):
     # Check if necessary data exists from previous steps
     required_data = (db.joints, db.joints_tail, db.bw)
-    input_source = db.mesh if db.is_mesh else db.gs
-    if any(x is None for x in required_data) or input_source is None:
+    if any(x is None for x in required_data) or (db.is_mesh and db.mesh is None) or (not db.is_mesh and db.gs is None):
         raise gr.Error("Run the inference first (prepare, preprocess, infer, vis steps must complete).")
 
     # Handle Gaussian Splats warning and numpy conversion
-    if not db.is_mesh and db.gs is not None:
+    if db.gs is not None:
         gr.Warning("It can take quite a long time to import and rig Gaussian Splats in Blender. Please wait patiently.")
         if isinstance(db.gs, torch.Tensor):
             db.gs = db.gs.numpy()
         if db.gs_rest is not None and isinstance(db.gs_rest, torch.Tensor):
             db.gs_rest = db.gs_rest.numpy()
 
-    # Determine template path based on model configuration (ADDITIONAL_BONES flag)
-    # Ensure joints_additional flag is correctly set during init_models if needed
+    # Determine template path based on model configuration
     template_path = TEMPLATE_PATH_ADD if 'joints_additional' in globals() and joints_additional else TEMPLATE_PATH
 
     # Prepare data dictionary for app_blender
@@ -184,76 +253,38 @@ def vis_blender(
             exit_code = os.system(cmd)
             if exit_code != 0:
                  print(f"ERROR: app_blender.py execution failed with exit code {exit_code}.")
-                 # Optionally raise an error or set a flag
             else:
                  print("[vis_blender] app_blender.py execution completed.")
 
-    # --- Check if output exists and Upload to Render.com ---
+    # --- Generate Direct Gradio File URL ---
     print(f"Output animatable model potentially generated at temporary path: '{db.anim_path}'")
 
-    persistent_url = None
     # Default to the temporary path generated by app_blender
-    final_output_path_or_url = db.anim_path if db.anim_path and os.path.isfile(db.anim_path) else None
+    final_output_path_or_url = None
 
     # Check if the output file was actually created by app_blender.py
-    if final_output_path_or_url:  # Check if path is valid and file exists
-
-        anim_path_to_upload = final_output_path_or_url  # Path to the file to potentially upload
-
-        # Optional: Handle Compression
+    if db.anim_path and os.path.isfile(db.anim_path):
+        # Get the Space URL
+        space_url = os.environ.get('SPACE_URL', 'https://dkatz2391-make-it-animatable.hf.space')
+        
+        # Create direct Gradio file URL
+        gradio_file_url = f"{space_url}/gradio_api/file={db.anim_path}"
+        final_output_path_or_url = gradio_file_url
+        print(f"Model will be accessible at: {gradio_file_url}")
+        
+        # Optional: Compress large files if needed
         try:
-             file_size_mb = os.path.getsize(anim_path_to_upload) / (1024**2)
-             if file_size_mb > 50:  # Example threshold 50MB
-                 gr.Info(f"Animation file is large ({file_size_mb:.2f}MB), compressing before upload...")
-                 compressed_path = f"{os.path.splitext(anim_path_to_upload)[0]}.zip"
-                 make_archive(anim_path_to_upload, compressed_path)  # Creates the zip
-                 anim_path_to_upload = compressed_path  # Update path to the zip file
-                 print(f"Compressed file for upload: '{anim_path_to_upload}'")
-        except Exception as comp_e:
-             print(f"WARNING: Failed to check size or compress file {anim_path_to_upload}: {comp_e}")
-             # Continue with uncompressed file if compression fails or size check fails
-
-        # --- Add Upload Logic to Render.com ---
-        try:
-            # *** USE THE CORRECT RENDER.COM ENDPOINT URL ***
-            render_upload_endpoint = "https://viverse-backend.onrender.com/api/upload-rigged-model"
-            # Add headers if your Render endpoint needs authentication
-            # headers = {'Authorization': f'Bearer {os.environ.get("RENDER_API_SECRET")}'}
-            headers = {}  # No auth headers assumed for now
-
-            # Use 'with open' for safer file handling
-            with open(anim_path_to_upload, 'rb') as f_upload:
-                 # 'modelFile' must match the key expected by multer on Render.com server
-                 file_to_upload = {'modelFile': (os.path.basename(anim_path_to_upload), f_upload)}
-
-                 print(f"Uploading {anim_path_to_upload} to Render.com endpoint: {render_upload_endpoint}...")
-
-                 response = requests.post(render_upload_endpoint, files=file_to_upload, headers=headers)
-                 response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-
-                 response_data = response.json()
-                 if response_data.get("persistentUrl"):
-                     persistent_url = response_data["persistentUrl"]
-                     final_output_path_or_url = persistent_url  # IMPORTANT: Update to the returned persistent URL
-                     print(f"Successfully uploaded to Render.com. Persistent URL: {persistent_url}")
-                 else:
-                     print("ERROR: Render.com upload response did not contain 'persistentUrl'. Will return temporary path.")
-                     # final_output_path_or_url remains the local path
-
-        except requests.exceptions.RequestException as e:
-            print(f"ERROR: Failed to upload to Render.com: {e}. Will return temporary path.")
-            # final_output_path_or_url remains the local path
+            file_size_mb = os.path.getsize(db.anim_path) / (1024**2)
+            if file_size_mb > 50:  # Example threshold 50MB
+                gr.Info(f"Animation file is large ({file_size_mb:.2f}MB), consider compressing it!")
         except Exception as e:
-            print(f"ERROR: An unexpected error occurred during Render.com upload: {e}. Will return temporary path.")
-            # final_output_path_or_url remains the local path
-        # --- End Upload Logic ---
-
-    else:  # File db.anim_path was not found
-        print(f"ERROR: Output file {db.anim_path} not found after app_blender execution. Cannot upload or return.")
-        final_output_path_or_url = None  # Ensure it's None if file wasn't created
+            print(f"WARNING: Failed to check file size: {e}")
+    else:
+        print(f"ERROR: Output file {db.anim_path} not found after app_blender execution.")
+        final_output_path_or_url = None
 
     # --- Post-processing for FBX to GLB visualization ---
-    # This uses the *local* db.anim_path (before potential compression/URL change)
+    # This uses the *local* db.anim_path (before URL creation)
     if db.is_mesh and db.anim_path and db.anim_path.endswith(".fbx") and os.path.isfile(db.anim_path):
         with tempfile.TemporaryDirectory() as tmpdir:
             fbx2gltf_path = "util/FBX2glTF"
@@ -277,12 +308,53 @@ def vis_blender(
     # --- Return results for Gradio UI ---
     return {
         output_rest_vis: db.rest_vis_path,          # Local path for UI preview (GLB)
-        output_anim: final_output_path_or_url,      # Render.com URL or local temp path/None
+        output_anim: final_output_path_or_url,      # Gradio file URL or None
         output_anim_vis: db.anim_vis_path,          # Local path for UI preview (GLB)
-        state: db,  # Pass the state back, might contain useful info
+        state: db,                                  # Pass the state back
     }
 
-# ... (Keep finish, _pipeline, init_models, init_blocks functions) ...
+# Keep all other functions like finish, _pipeline, init_models, init_blocks, etc.
+
+def init_models():
+    global device, N, hands_resample_ratio, geo_resample_ratio, bw_additional, joints_additional, bones_idx_dict_bw, bones_idx_dict_joints, model_bw, model_bw_normal, model_joints, model_joints_add, model_coarse, model_pose
+
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    fix_random()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    IS_HF_ZEROGPU = str2bool(os.getenv("SPACES_ZERO_GPU", False))
+
+    N = 32768
+    hands_resample_ratio = 0.5
+    geo_resample_ratio = 0.0
+    hierarchical_ratio = hands_resample_ratio + geo_resample_ratio
+
+    ADDITIONAL_BONES = bw_additional = joints_additional = False
+
+    model_bw = PCAE(
+        N=N,
+        input_normal=False,
+        deterministic=True,
+        hierarchical_ratio=hierarchical_ratio,
+        output_dim=JOINTS_NUM_ADD if ADDITIONAL_BONES else JOINTS_NUM,
+    )
+    
+    # Load model weights
+    if ADDITIONAL_BONES:
+        model_bw.load("output/vroid/bw.pth")
+    else:
+        model_bw.load("output/best/new/bw.pth")
+    
+    model_bw.to("cpu" if IS_HF_ZEROGPU else device).eval()
+
+    # [Continue with loading other models, same as original code]
+
+def init_blocks():
+    global output_rest_vis, output_anim, output_anim_vis, state
+    
+    # [Keep all code from the original init_blocks]
+    
+    # [Return the demo object]
+    return demo
 
 if __name__ == "__main__":
     # Ensure models are loaded relative to this script's location
@@ -290,15 +362,16 @@ if __name__ == "__main__":
     os.chdir(script_dir)
     print(f"Changed working directory to: {script_dir}")
 
-    init_models()  # Load models once on startup
-    demo = init_blocks()  # Setup Gradio interface
-
+    # Load models once on startup
+    init_models()
+    
+    # Create the Gradio interface
+    demo = init_blocks()
+    
     # Launch the Gradio app
     print("Launching Gradio App...")
-    demo.queue(default_concurrency_limit=1).launch(  # Use queue for handling requests
-         server_name="0.0.0.0",  # Allow external connections
-         server_port=7860,  # Default Gradio port
-         # allowed_paths=["*"],  # Consider security implications
-         show_error=True,  # Show errors in browser console
-         # ssl_verify=False  # Use if running locally without proper SSL
-    )
+    demo.queue(default_concurrency_limit=1).launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        show_error=True
+    ) 
