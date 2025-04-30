@@ -53,6 +53,7 @@ from util.utils import (
     to_pose_local,
     to_pose_matrix,
     transform_gs,
+    change_Model3D,
 )
 
 # Monkey patching to correct the loaded example values from csv
@@ -786,6 +787,31 @@ async def rig_from_url_api(request: Request):
 def run_api():
     import uvicorn
     uvicorn.run(api_app, host="0.0.0.0", port=8000)
+
+def ply2visible(ply_path: str, is_gs=False):
+    """
+    Gradio now reads and renders `ply` as gsplats instead of mesh.
+    To display `ply` as mesh, we need to convert it to other format.
+    """
+    if not isinstance(ply_path, str):
+        return ply_path
+    if not ply_path.endswith(".ply"):
+        ply_path_ = f"{os.path.splitext(ply_path)[0]}.ply"
+        if os.path.isfile(ply_path_):
+            ply_path = ply_path_
+    with TimePrints():
+        print(f"Get input: {ply_path}")
+
+    if not ply_path.endswith(".ply") or is_gs:
+        return change_Model3D(ply_path, False)
+    with contextlib.suppress(Exception):
+        load_gs(ply_path)
+        gr.Warning("The input file seems to be Gaussian Splats, enable 'Input is GS' to display it")
+    mesh = trimesh.load(ply_path, process=False, maintain_order=True)
+    is_pc = isinstance(mesh, trimesh.PointCloud)
+    new_path = f"{os.path.splitext(ply_path)[0]}.glb"
+    mesh.export(new_path)
+    return change_Model3D(new_path, is_pc)
 
 if __name__ == "__main__":
     # Ensure models are loaded relative to this script's location
